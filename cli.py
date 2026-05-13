@@ -4917,10 +4917,6 @@ class HermesCLI:
         with _suspend_output_history():
             self._console_print(panel)
 
-    def _render_resume_history_panel_lines(self, panel) -> list[str]:
-        """Render the resume panel at the current terminal width for resize replay."""
-        return render_rich_to_ansi(panel)
-
     def _try_attach_clipboard_image(self) -> bool:
         """Check clipboard for an image and attach it if found.
 
