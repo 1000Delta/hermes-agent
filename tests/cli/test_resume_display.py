@@ -298,7 +298,13 @@ class TestDisplayResumedHistory:
 
             assert "Previous Conversation" in output
             assert len(cli_mod._OUTPUT_HISTORY) == 1
-            assert callable(cli_mod._OUTPUT_HISTORY[0])
+            entry = cli_mod._OUTPUT_HISTORY[0]
+            assert isinstance(entry, cli_mod.RichRenderableEntry)
+            narrow = [cli_mod._ANSI_CONTROL_RE.sub("", line) for line in entry.render(80)]
+            wide = [cli_mod._ANSI_CONTROL_RE.sub("", line) for line in entry.render(120)]
+            assert narrow != wide
+            assert len(narrow[0]) == 80
+            assert len(wide[0]) == 120
         finally:
             cli_mod._configure_output_history(True, 200)
 

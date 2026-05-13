@@ -1354,7 +1354,7 @@ def _preserve_windows_dot_segments_for_markdown(text: str) -> str:
     return _WINDOWS_PATH_WITH_DOT_SEGMENT_RE.sub(_protect, text)
 
 
-def _terminal_width_for_streaming() -> int:
+def _terminal_width_for_streaming(width: int | None = None) -> int:
     """Display cells available inside the streamed response box.
 
     The streaming path indents every line by ``_STREAM_PAD`` (4 cells)
@@ -1365,10 +1365,16 @@ def _terminal_width_for_streaming() -> int:
     table into mid-cell soft-wrap.
     """
 
-    try:
-        cols = shutil.get_terminal_size((80, 24)).columns
-    except Exception:
-        cols = 80
+    if width is not None:
+        try:
+            cols = int(width)
+        except (TypeError, ValueError):
+            cols = 80
+    else:
+        try:
+            cols = shutil.get_terminal_size((80, 24)).columns
+        except Exception:
+            cols = 80
     return max(20, cols - len(_STREAM_PAD) - 2)
 
 
@@ -1418,6 +1424,47 @@ _OUTPUT_HISTORY = deque(maxlen=_OUTPUT_HISTORY_MAX_LINES)
 _ANSI_CONTROL_RE = re.compile(
     r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
 )
+# Keep SGR (Select Graphic Rendition) color/style escapes in replay history.
+# Resize recovery replays these strings through prompt_toolkit's ANSI renderer;
+# stripping SGR here makes previously colored Rich panels (e.g. the
+# ``╭─ ⚕ Hermes ─`` response box) come back monochrome after a SIGWINCH redraw.
+# Non-SGR controls (cursor movement, erase, OSC, etc.) are still removed so
+# replayed history cannot move the cursor or mutate terminal state.
+_ANSI_NON_SGR_CONTROL_RE = re.compile(
+    r"\x1b(?:[@-Z\\-_]|\[(?![0-?]*[ -/]*m)[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
+)
+
+
+def _output_history_display_width(text: str) -> int:
+    """Return terminal display width for replayable CLI chrome."""
+    try:
+        from prompt_toolkit.utils import get_cwidth
+        return get_cwidth(text or "")
+    except Exception:
+        return len(text or "")
+
+
+def _stream_response_width(width: int | None = None) -> int:
+    if width is not None:
+        try:
+            return int(width)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        return 80
+
+
+def _stream_response_top_border(label: str, width: int | None = None) -> str:
+    w = _stream_response_width(width)
+    fill = w - 2 - _output_history_display_width(label)
+    return f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}"
+
+
+def _stream_response_bottom_border(width: int | None = None) -> str:
+    w = _stream_response_width(width)
+    return f"{_ACCENT}╰{'─' * max(w - 2, 0)}╯{_RST}"
 
 
 def _coerce_output_history_limit(value) -> int:
@@ -1427,68 +1474,356 @@ def _coerce_output_history_limit(value) -> int:
         return 200
 
 
+def render_rich_to_ansi(renderable, width: int | None = None) -> list[str]:
+    """Render a Rich renderable to ANSI lines using an explicit replay width."""
+    from io import StringIO
+
+    try:
+        render_width = _stream_response_width(width)
+    except Exception:
+        render_width = 80
+    buf = StringIO()
+    console = Console(
+        file=buf,
+        force_terminal=True,
+        color_system="truecolor",
+        highlight=False,
+        width=render_width,
+    )
+    console.print(renderable)
+    return buf.getvalue().rstrip("\n").splitlines()
+
+
+class RichRenderableEntry:
+    """Semantic Rich renderable replayed through a width-aware Console."""
+
+    def __init__(self, renderable):
+        self.renderable = renderable
+
+    def render(self, width: int | None = None) -> list[str]:
+        return render_rich_to_ansi(self.renderable, width)
+
+    def __repr__(self) -> str:
+        return f"RichRenderableEntry({self.renderable!r})"
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, RichRenderableEntry):
+            return False
+        return self.renderable == other.renderable
+
+
+class StaticAnsiEntry:
+    """Replayable static ANSI line with only safe terminal controls kept."""
+
+    def __init__(self, text: str):
+        self.text = str(text)
+
+    def render(self, width: int | None = None) -> list[str]:
+        return [self.text]
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __repr__(self) -> str:
+        return repr(self.text)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, StaticAnsiEntry):
+            return self.text == other.text
+        if isinstance(other, str):
+            return self.text == other
+        return False
+
+
+class CallableHistoryEntry:
+    """Compatibility wrapper for legacy output-history callables."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self):
+        return self.fn()
+
+    def render(self, width: int | None = None) -> list[str]:
+        lines = self.fn()
+        if isinstance(lines, str):
+            return lines.splitlines() or [lines]
+        return list(lines or [])
+
+    def __repr__(self) -> str:
+        return repr(self.fn)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, CallableHistoryEntry):
+            return self.fn == other.fn
+        return self.fn == other
+
+
+class ResponseBorderEntry:
+    """Semantic stream-response border entry rendered at replay width."""
+
+    def __init__(self, kind: str, label: str = ""):
+        if kind not in {"top", "bottom"}:
+            raise ValueError("response border kind must be 'top' or 'bottom'")
+        self.kind = kind
+        self.label = str(label)
+
+    def render(self, width: int | None = None) -> list[str]:
+        if self.kind == "top":
+            return [_stream_response_top_border(self.label, width=width)]
+        return [_stream_response_bottom_border(width=width)]
+
+    def __repr__(self) -> str:
+        return f"ResponseBorderEntry({self.kind!r}, {self.label!r})"
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, ResponseBorderEntry):
+            return False
+        return self.kind == other.kind and self.label == other.label
+
+
+class AssistantResponseEntry:
+    """Semantic assistant response replayed at the current terminal width."""
+
+    def __init__(
+        self,
+        label: str,
+        source_text: str = "",
+        *,
+        text_ansi: str = "",
+        markdown_mode: str = "strip",
+        completed: bool = False,
+    ):
+        self.label = str(label)
+        self.source_text = str(source_text or "")
+        self.text_ansi = str(text_ansi or "")
+        self.markdown_mode = str(markdown_mode or "strip").strip().lower() or "strip"
+        if self.markdown_mode not in {"render", "strip", "raw"}:
+            self.markdown_mode = "strip"
+        self.completed = bool(completed)
+
+    def append_text(self, text: str) -> None:
+        self.source_text += str(text or "")
+
+    def mark_completed(self) -> None:
+        self.completed = True
+
+    def _format_body_source(self, width: int | None = None) -> str:
+        text = self.source_text.rstrip("\n")
+        if self.markdown_mode == "strip":
+            text = _strip_markdown_syntax(text)
+        elif self.markdown_mode == "render":
+            # Keep replay aligned with the existing streaming path.  Full Rich
+            # Markdown rendering is reserved for the non-stream final panel;
+            # resize replay reuses the same table normalisation and line body
+            # shape that streamed output used when it first appeared.
+            text = _rich_text_from_ansi(text).plain
+            text = _preserve_windows_dot_segments_for_markdown(text)
+        return text
+
+    def _render_body_lines(self, width: int | None = None) -> list[str]:
+        body_width = _terminal_width_for_streaming(width)
+        text = self._format_body_source(width)
+        if not text:
+            return []
+        realigned = realign_markdown_tables(text, body_width)
+        rendered: list[str] = []
+        for line in realigned.split("\n"):
+            if line == "":
+                rendered.append(_STREAM_PAD.rstrip())
+                continue
+            visible = _ANSI_CONTROL_RE.sub("", line)
+            if _output_history_display_width(visible) <= body_width:
+                rendered.append(self._style_body_line(line))
+                continue
+            wrapped = textwrap.wrap(
+                visible,
+                width=body_width,
+                break_long_words=False,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+                drop_whitespace=True,
+            ) or [visible]
+            rendered.extend(self._style_body_line(part) for part in wrapped)
+        return rendered
+
+    def _style_body_line(self, line: str) -> str:
+        if self.text_ansi:
+            return f"{_STREAM_PAD}{self.text_ansi}{line}{_RST}"
+        return f"{_STREAM_PAD}{line}"
+
+    def render(self, width: int | None = None) -> list[str]:
+        lines = [_stream_response_top_border(self.label, width=width)]
+        lines.extend(self._render_body_lines(width))
+        if self.completed:
+            lines.append(_stream_response_bottom_border(width=width))
+        return lines
+
+    def __repr__(self) -> str:
+        state = "completed" if self.completed else "open"
+        return f"AssistantResponseEntry({self.label!r}, {len(self.source_text)} chars, {state})"
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, AssistantResponseEntry):
+            return False
+        return (
+            self.label == other.label
+            and self.source_text == other.source_text
+            and self.text_ansi == other.text_ansi
+            and self.markdown_mode == other.markdown_mode
+            and self.completed == other.completed
+        )
+
+
+class DisplayHistory:
+
+    """Recent classic-CLI scrollback entries replayed after redraw/resize."""
+
+    def __init__(self, enabled: bool = True, max_lines=200):
+        self.enabled = bool(enabled)
+        self.max_lines = _coerce_output_history_limit(max_lines)
+        self.entries = deque(maxlen=self.max_lines)
+        self.replaying = False
+        self.suppressed = False
+
+    def configure(self, enabled: bool, max_lines=200) -> None:
+        self.enabled = bool(enabled)
+        self.max_lines = _coerce_output_history_limit(max_lines)
+        self.entries = deque(maxlen=self.max_lines)
+
+    def clear(self) -> None:
+        self.entries.clear()
+
+    @contextmanager
+    def suspend(self):
+        old_value = self.suppressed
+        self.suppressed = True
+        try:
+            yield
+        finally:
+            self.suppressed = old_value
+
+    def _should_record(self) -> bool:
+        return self.enabled and not self.replaying and not self.suppressed
+
+    def _coerce_entry(self, entry):
+        if isinstance(entry, (StaticAnsiEntry, CallableHistoryEntry)):
+            return entry
+        if hasattr(entry, "render"):
+            return entry
+        if callable(entry):
+            return CallableHistoryEntry(entry)
+        return StaticAnsiEntry(str(entry))
+
+    def record_entry(self, entry) -> None:
+        if not self._should_record():
+            return
+        self.entries.append(self._coerce_entry(entry))
+
+    def record_text(self, text: str) -> None:
+        if not self._should_record():
+            return
+        raw = str(text)
+        normalized = raw.replace("\r\n", "\n")
+        if "\r" in normalized:
+            # Bare carriage-return output is live terminal chrome (spinners,
+            # progress overwrites, prompt/status redraw fragments).  Once the
+            # cursor movement is stripped, replaying the remaining text turns
+            # transient frames and erase padding into durable scrollback noise.
+            # Preserve CRLF line endings above so legitimate transcript text
+            # from Windows-style output can still enter scrollback history.
+            return
+        cleaned = _ANSI_NON_SGR_CONTROL_RE.sub("", normalized).rstrip("\n")
+        for line in cleaned.splitlines():
+            if not _ANSI_CONTROL_RE.sub("", line):
+                continue
+            self.record_entry(StaticAnsiEntry(line))
+
+    def replay(self, printer=None, ansi_factory=None, width: int | None = None) -> None:
+        """Repaint recent output above the prompt after a full screen clear."""
+        if not self.enabled or not self.entries:
+            return
+        if printer is None:
+            printer = _pt_print
+        if ansi_factory is None:
+            ansi_factory = _PT_ANSI
+        if width is None:
+            try:
+                width = shutil.get_terminal_size((80, 24)).columns
+            except Exception:
+                width = 80
+
+        self.replaying = True
+        _sync_output_history_globals()
+        try:
+            for entry in tuple(self.entries):
+                try:
+                    if hasattr(entry, "render"):
+                        lines = entry.render(width)
+                    elif callable(entry):
+                        lines = entry()
+                    else:
+                        lines = [entry]
+                    if isinstance(lines, str):
+                        lines = lines.splitlines()
+                except Exception:
+                    continue
+                for line in lines:
+                    printer(ansi_factory(str(line)))
+        except Exception:
+            pass
+        finally:
+            self.replaying = False
+            _sync_output_history_globals()
+
+
+_DISPLAY_HISTORY = DisplayHistory(_OUTPUT_HISTORY_ENABLED, _OUTPUT_HISTORY_MAX_LINES)
+_OUTPUT_HISTORY = _DISPLAY_HISTORY.entries
+
+
+def _sync_output_history_globals() -> None:
+    global _OUTPUT_HISTORY_ENABLED, _OUTPUT_HISTORY_REPLAYING, _OUTPUT_HISTORY_SUPPRESSED
+    global _OUTPUT_HISTORY_MAX_LINES, _OUTPUT_HISTORY
+    _OUTPUT_HISTORY_ENABLED = _DISPLAY_HISTORY.enabled
+    _OUTPUT_HISTORY_REPLAYING = _DISPLAY_HISTORY.replaying
+    _OUTPUT_HISTORY_SUPPRESSED = _DISPLAY_HISTORY.suppressed
+    _OUTPUT_HISTORY_MAX_LINES = _DISPLAY_HISTORY.max_lines
+    _OUTPUT_HISTORY = _DISPLAY_HISTORY.entries
+
+
 def _configure_output_history(enabled: bool, max_lines=200) -> None:
     """Configure recent CLI output replayed after terminal redraws."""
-    global _OUTPUT_HISTORY_ENABLED, _OUTPUT_HISTORY_MAX_LINES, _OUTPUT_HISTORY
-    _OUTPUT_HISTORY_ENABLED = bool(enabled)
-    _OUTPUT_HISTORY_MAX_LINES = _coerce_output_history_limit(max_lines)
-    _OUTPUT_HISTORY = deque(maxlen=_OUTPUT_HISTORY_MAX_LINES)
+    _DISPLAY_HISTORY.configure(enabled, max_lines)
+    _sync_output_history_globals()
 
 
 def _clear_output_history() -> None:
-    _OUTPUT_HISTORY.clear()
+    _DISPLAY_HISTORY.clear()
+    _sync_output_history_globals()
 
 
 @contextmanager
 def _suspend_output_history():
-    global _OUTPUT_HISTORY_SUPPRESSED
-    old_value = _OUTPUT_HISTORY_SUPPRESSED
-    _OUTPUT_HISTORY_SUPPRESSED = True
     try:
-        yield
+        with _DISPLAY_HISTORY.suspend():
+            _sync_output_history_globals()
+            yield
     finally:
-        _OUTPUT_HISTORY_SUPPRESSED = old_value
+        _sync_output_history_globals()
 
 
 def _record_output_history_entry(entry) -> None:
-    if not _OUTPUT_HISTORY_ENABLED or _OUTPUT_HISTORY_REPLAYING or _OUTPUT_HISTORY_SUPPRESSED:
-        return
-    _OUTPUT_HISTORY.append(entry)
+    _DISPLAY_HISTORY.record_entry(entry)
+    _sync_output_history_globals()
 
 
 def _record_output_history(text: str) -> None:
-    if not _OUTPUT_HISTORY_ENABLED or _OUTPUT_HISTORY_REPLAYING or _OUTPUT_HISTORY_SUPPRESSED:
-        return
-    clean = _ANSI_CONTROL_RE.sub("", str(text)).replace("\r", "").rstrip("\n")
-    if not clean:
-        return
-    for line in clean.splitlines():
-        _record_output_history_entry(line)
+    _DISPLAY_HISTORY.record_text(text)
+    _sync_output_history_globals()
 
 
 def _replay_output_history() -> None:
-    """Repaint recent output above the prompt after a full screen clear."""
-    global _OUTPUT_HISTORY_REPLAYING
-    if not _OUTPUT_HISTORY_ENABLED or not _OUTPUT_HISTORY:
-        return
-    _OUTPUT_HISTORY_REPLAYING = True
-    try:
-        for entry in tuple(_OUTPUT_HISTORY):
-            if callable(entry):
-                try:
-                    lines = entry()
-                except Exception:
-                    continue
-                if isinstance(lines, str):
-                    lines = lines.splitlines()
-            else:
-                lines = [entry]
-            for line in lines:
-                _pt_print(_PT_ANSI(str(line)))
-    except Exception:
-        pass
-    finally:
-        _OUTPUT_HISTORY_REPLAYING = False
+    _DISPLAY_HISTORY.replay()
 
 
 def _cprint(text: str):
@@ -1572,6 +1907,12 @@ def _cprint(text: str):
             _pt_print(_PT_ANSI(text))
         except Exception:
             pass
+
+
+def _cprint_transient(text: str):
+    """Print live UI chrome without adding it to resize replay history."""
+    with _suspend_output_history():
+        _cprint(text)
 
 
 # ---------------------------------------------------------------------------
@@ -3668,17 +4009,28 @@ class HermesCLI:
                 self._stream_text_ansi = ""
             if self.show_timestamps:
                 label = f"{label} {datetime.now().strftime('%H:%M')}"
-            w = shutil.get_terminal_size().columns
-            fill = w - 2 - HermesCLI._status_bar_display_width(label)
-            _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+            top_border = _stream_response_top_border(label)
+            with _suspend_output_history():
+                _cprint(top_border)
+            self._stream_history_entry = AssistantResponseEntry(
+                label,
+                text_ansi=getattr(self, "_stream_text_ansi", ""),
+                markdown_mode=getattr(self, "final_response_markdown", "strip"),
+                completed=False,
+            )
+            _record_output_history_entry(self._stream_history_entry)
 
         self._stream_buf += text
+        history_entry = getattr(self, "_stream_history_entry", None)
+        if isinstance(history_entry, AssistantResponseEntry):
+            history_entry.append_text(text)
 
         # Emit complete lines, keep partial remainder in buffer
         _tc = getattr(self, "_stream_text_ansi", "")
 
         def _emit_one(printed_line: str) -> None:
-            _cprint(f"{_STREAM_PAD}{_tc}{printed_line}{_RST}" if _tc else f"{_STREAM_PAD}{printed_line}")
+            with _suspend_output_history():
+                _cprint(f"{_STREAM_PAD}{_tc}{printed_line}{_RST}" if _tc else f"{_STREAM_PAD}{printed_line}")
 
         def _flush_table_buf() -> None:
             buf = self._stream_table_buf
@@ -3760,17 +4112,25 @@ class HermesCLI:
                 joined = _strip_markdown_syntax(joined)
             block = realign_markdown_tables(joined, _terminal_width_for_streaming())
             for ln in block.split("\n"):
-                _cprint(f"{_STREAM_PAD}{_tc}{ln}{_RST}" if _tc else f"{_STREAM_PAD}{ln}")
+                with _suspend_output_history():
+                    _cprint(f"{_STREAM_PAD}{_tc}{ln}{_RST}" if _tc else f"{_STREAM_PAD}{ln}")
 
         if self._stream_buf:
             line = _strip_markdown_syntax(self._stream_buf) if self.final_response_markdown == "strip" else self._stream_buf
-            _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
+            with _suspend_output_history():
+                _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
             self._stream_buf = ""
 
         # Close the response box
         if self._stream_box_opened:
-            w = shutil.get_terminal_size().columns
-            _cprint(f"{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+            bottom_border = _stream_response_bottom_border()
+            with _suspend_output_history():
+                _cprint(bottom_border)
+            history_entry = getattr(self, "_stream_history_entry", None)
+            if isinstance(history_entry, AssistantResponseEntry):
+                history_entry.mark_completed()
+            else:
+                _record_output_history_entry(ResponseBorderEntry("bottom"))
 
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
@@ -3787,6 +4147,7 @@ class HermesCLI:
         self._deferred_content = ""
         self._stream_table_buf = []
         self._in_stream_table = False
+        self._stream_history_entry = None
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -4552,26 +4913,9 @@ class HermesCLI:
             padding=(0, 1),
             style=_history_text_c,
         )
-        _record_output_history_entry(lambda: self._render_resume_history_panel_lines(panel))
+        _record_output_history_entry(RichRenderableEntry(panel))
         with _suspend_output_history():
             self._console_print(panel)
-
-    def _render_resume_history_panel_lines(self, panel) -> list[str]:
-        """Render the resume panel at the current terminal width for resize replay."""
-        from io import StringIO
-
-        buf = StringIO()
-        width = shutil.get_terminal_size((80, 24)).columns
-        console = Console(
-            file=buf,
-            force_terminal=True,
-            color_system="truecolor",
-            highlight=False,
-            width=width,
-        )
-        with _suspend_output_history():
-            console.print(panel)
-        return buf.getvalue().rstrip("\n").splitlines()
 
     def _try_attach_clipboard_image(self) -> bool:
         """Check clipboard for an image and attach it if found.
@@ -9187,7 +9531,7 @@ class HermesCLI:
 
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚡")
-        _cprint(f"  ┊ {emoji} preparing {tool_name}…")
+        _cprint_transient(f"  ┊ {emoji} preparing {tool_name}…")
 
     # ====================================================================
     # Tool progress callback (audio cues for voice mode)
@@ -10389,12 +10733,13 @@ class HermesCLI:
                     nonlocal _streaming_box_opened
                     if not _streaming_box_opened:
                         _streaming_box_opened = True
-                        w = self.console.width
                         label = " ⚕ Hermes "
                         if self.show_timestamps:
                             label = f"{label}{datetime.now().strftime('%H:%M')} "
-                        fill = w - 2 - HermesCLI._status_bar_display_width(label)
-                        _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+                        top_border = _stream_response_top_border(label)
+                        with _suspend_output_history():
+                            _cprint(top_border)
+                        _record_output_history_entry(ResponseBorderEntry("top", label))
                     _cprint(f"{_STREAM_PAD}{sentence.rstrip()}")
 
                 tts_thread = threading.Thread(
@@ -10705,8 +11050,10 @@ class HermesCLI:
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
                 if use_streaming_tts and _streaming_box_opened and not is_error_response:
                     # Text was already printed sentence-by-sentence; just close the box
-                    w = shutil.get_terminal_size().columns
-                    _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
+                    bottom_border = _stream_response_bottom_border()
+                    with _suspend_output_history():
+                        _cprint(f"\n{bottom_border}")
+                    _record_output_history_entry(ResponseBorderEntry("bottom"))
                 elif already_streamed:
                     # Response was already streamed token-by-token with box framing;
                     # _flush_stream() already closed the box. Skip Rich Panel.
