@@ -90,33 +90,40 @@ class TestForceFullRedraw:
         events = []
         out.reset_attributes.side_effect = lambda: events.append("reset_attrs")
         out.erase_screen.side_effect = lambda: events.append("erase")
+        out.write_raw.side_effect = lambda value: events.append(f"write_raw:{value!r}")
         out.cursor_goto.side_effect = lambda *_: events.append("home")
         out.flush.side_effect = lambda: events.append("flush")
         app.renderer.reset.side_effect = lambda **_: events.append("renderer_reset")
         app.invalidate.side_effect = lambda: events.append("invalidate")
+        app.layout.focus.side_effect = lambda target: events.append(("focus", target))
         original_on_resize = lambda: events.append("original_resize")
         monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
 
-        # bare_cli skips __init__, so seed the attribute the way __init__ would.
-        bare_cli._status_bar_suppressed_after_resize = False
+        # bare_cli skips __init__, so seed the attributes the way __init__/run would.
+        bare_cli._status_bar_suppressed_after_resize = True
+        bare_cli._tui_input_area = object()
         bare_cli._recover_after_resize(app, original_on_resize)
 
         assert events == [
             "reset_attrs",
             "erase",
+            "write_raw:'\\x1b[3J'",
             "home",
             "flush",
             "renderer_reset",
             "replay",
             "original_resize",
+            ("focus", bare_cli._tui_input_area),
+            "renderer_reset",
             "invalidate",
         ]
         out.erase_screen.assert_called_once()
         out.cursor_goto.assert_called_once_with(0, 0)
         out.write_raw.assert_called_once_with("\x1b[3J")
-        app.renderer.reset.assert_called_once_with(leave_alternate_screen=False)
-        # Status bar / input rules must be suppressed until the next prompt.
-        assert bare_cli._status_bar_suppressed_after_resize is True
+        assert app.renderer.reset.call_count == 2
+        app.renderer.reset.assert_any_call(leave_alternate_screen=False)
+        # The prompt/input chrome must be visible immediately after resize.
+        assert bare_cli._status_bar_suppressed_after_resize is False
 
     def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli):
         app = MagicMock()

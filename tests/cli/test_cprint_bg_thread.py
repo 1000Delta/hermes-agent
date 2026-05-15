@@ -12,6 +12,7 @@ These tests verify the routing logic without spinning up a real PT app.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -306,3 +307,33 @@ def test_clear_output_history_removes_replayable_lines():
     cli._clear_output_history()
 
     assert list(cli._OUTPUT_HISTORY) == []
+
+
+def test_startup_banner_history_entry_rerenders_at_current_width(monkeypatch):
+    cli._configure_output_history(True, 10)
+    cli_obj = object.__new__(cli.HermesCLI)
+    cli_obj.compact = True
+    cli_obj.enabled_toolsets = []
+    cli_obj.model = "test-model"
+    cli_obj.session_id = "test-session"
+    cli_obj.agent = None
+    widths = [50]
+    printed = []
+
+    monkeypatch.setattr(
+        cli.shutil,
+        "get_terminal_size",
+        lambda fallback=(80, 24): os.terminal_size((widths[-1], 24)),
+    )
+    monkeypatch.setattr(cli, "_build_compact_banner", lambda: f"banner-width-{widths[-1]}")
+    monkeypatch.setattr(cli, "_pt_print", lambda value: printed.append(value))
+    monkeypatch.setattr(cli, "_PT_ANSI", lambda text: text)
+
+    cli_obj._record_startup_banner_for_resize()
+    cli._replay_output_history()
+    widths.append(100)
+    cli._replay_output_history()
+
+    assert printed == ["banner-width-50", "banner-width-100"]
+    assert len(cli._OUTPUT_HISTORY) == 1
+    assert callable(cli._OUTPUT_HISTORY[0])

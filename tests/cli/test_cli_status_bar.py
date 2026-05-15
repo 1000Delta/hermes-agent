@@ -332,22 +332,23 @@ class TestCLIStatusBar:
         assert cli_obj._tui_input_rule_height("bottom", width=50) == 0
         assert cli_obj._tui_input_rule_height("bottom", width=90) == 1
 
-    def test_input_rules_hide_after_resize_until_next_input(self):
-        """When _status_bar_suppressed_after_resize is set, both rules hide.
+    def test_input_rules_remain_visible_after_resize_recovery(self):
+        """Resize recovery clears stale chrome, then redraws live input rules.
 
-        See _recover_after_resize — column shrink reflows already-rendered
-        bars into scrollback, so we hide the separators until the user
-        submits the next input, at which point the flag is cleared.
+        Since _recover_after_resize now clears the visible screen and
+        scrollback before replaying history, it should not suppress the input
+        prompt/chrome until the next keystroke; that made the prompt appear to
+        disappear after resize.
         """
         cli_obj = _make_cli()
-        cli_obj._status_bar_suppressed_after_resize = True
-
-        assert cli_obj._tui_input_rule_height("top", width=90) == 0
-        assert cli_obj._tui_input_rule_height("bottom", width=90) == 0
-
         cli_obj._status_bar_suppressed_after_resize = False
+
         assert cli_obj._tui_input_rule_height("top", width=90) == 1
         assert cli_obj._tui_input_rule_height("bottom", width=90) == 1
+
+        cli_obj._status_bar_suppressed_after_resize = True
+        assert cli_obj._tui_input_rule_height("top", width=90) == 0
+        assert cli_obj._tui_input_rule_height("bottom", width=90) == 0
 
     def test_scrollback_box_width_returns_viewport_width(self):
         """Decorative scrollback boxes use the full viewport width.

@@ -42,7 +42,7 @@ from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -2988,15 +2988,29 @@ class HermesCLI:
         width-aware history entries, so ``hermes -c`` can re-render them at
         the current width instead of keeping the stale startup width.
 
-        We also flag ``_status_bar_suppressed_after_resize`` so the dynamic
-        status bar and input separator rules stay hidden until the next user
-        input.  Clearing the suppression on the next prompt restores the bar
-        cleanly.
+        The visible screen/scrollback clear removes the stale-width input
+        chrome too, so the live prompt should be redrawn immediately at the
+        new width instead of being suppressed until the next keystroke.
         """
-        self._status_bar_suppressed_after_resize = True
+        self._status_bar_suppressed_after_resize = False
         self._clear_prompt_toolkit_screen(app, rebuild_scrollback=True)
         _replay_output_history()
         original_on_resize()
+        try:
+            input_area = getattr(self, "_tui_input_area", None)
+            if input_area is not None and getattr(app, "layout", None) is not None:
+                app.layout.focus(input_area)
+        except Exception:
+            pass
+        try:
+            # Re-drop prompt_toolkit's post-replay screen cache so the next
+            # invalidate paints the input prompt/status chrome from semantic
+            # layout state at the current terminal width.  Without this, a
+            # resize recovery can leave the transcript replay visible but the
+            # prompt row absent until another input event arrives.
+            app.renderer.reset(leave_alternate_screen=False)
+        except Exception:
+            pass
         try:
             app.invalidate()
         except Exception:
@@ -4576,38 +4590,73 @@ class HermesCLI:
             # logged at DEBUG by the advisory module.
             pass
 
-    def show_banner(self):
-        """Display the welcome banner in Claude Code style."""
-        self.console.clear()
+    def _get_startup_banner_context_length(self):
         ctx_len = None
         if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
             ctx_len = self.agent.context_compressor.context_length
-        
-        # Auto-compact for narrow terminals — the full banner with caduceus
-        # + tool list needs ~80 columns minimum to render without wrapping.
-        term_width = shutil.get_terminal_size().columns
-        use_compact = self.compact or term_width < 80
-        
-        if use_compact:
-            self._console_print(_build_compact_banner())
-            self._show_status()
+        return ctx_len
+
+    def _render_startup_banner_lines(self) -> list[str]:
+        """Render the startup banner at the current terminal width for replay."""
+        from io import StringIO
+
+        buf = StringIO()
+        width = shutil.get_terminal_size((80, 24)).columns
+        console = Console(
+            file=buf,
+            force_terminal=True,
+            color_system="truecolor",
+            highlight=False,
+            width=width,
+        )
+        if self.compact or width < 80:
+            console.print(_build_compact_banner())
         else:
-            # Get tools for display
-            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
-            
-            # Get terminal working directory (where commands will execute)
+            enabled_toolsets = cast(List[str], list(self.enabled_toolsets) if self.enabled_toolsets is not None else None)
+            tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True)
             cwd = os.getenv("TERMINAL_CWD", os.getcwd())
-            
-            # Build and display the banner
             build_welcome_banner(
-                console=self.console,
+                console=console,
                 model=self.model,
                 cwd=cwd,
                 tools=tools,
-                enabled_toolsets=self.enabled_toolsets,
+                enabled_toolsets=enabled_toolsets,
                 session_id=self.session_id,
-                context_length=ctx_len,
+                context_length=self._get_startup_banner_context_length(),
             )
+        return buf.getvalue().rstrip("\n").splitlines()
+
+    def _record_startup_banner_for_resize(self) -> None:
+        _record_output_history_entry(lambda: self._render_startup_banner_lines())
+
+    def _print_startup_banner(self, console) -> None:
+        """Print the startup banner once without raw-line history duplication."""
+        width = shutil.get_terminal_size((80, 24)).columns
+        if self.compact or width < 80:
+            console.print(_build_compact_banner())
+        else:
+            enabled_toolsets = cast(List[str], list(self.enabled_toolsets) if self.enabled_toolsets is not None else None)
+            tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True)
+            cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+            build_welcome_banner(
+                console=console,
+                model=self.model,
+                cwd=cwd,
+                tools=tools,
+                enabled_toolsets=enabled_toolsets,
+                session_id=self.session_id,
+                context_length=self._get_startup_banner_context_length(),
+            )
+
+    def show_banner(self):
+        """Display the welcome banner in Claude Code style."""
+        self.console.clear()
+        self._record_startup_banner_for_resize()
+        with _suspend_output_history():
+            self._print_startup_banner(self.console)
+        if self.compact or shutil.get_terminal_size((80, 24)).columns < 80:
+            self._show_status()
+        ctx_len = self._get_startup_banner_context_length()
         
         # Show tool availability warnings if any tools are disabled
         self._show_tool_availability_warnings()
@@ -7733,24 +7782,9 @@ class HermesCLI:
             # and gets mangled by patch_stdout).
             if self._app:
                 cc = ChatConsole()
-                term_w = shutil.get_terminal_size().columns
-                if self.compact or term_w < 80:
-                    cc.print(_build_compact_banner())
-                else:
-                    tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
-                    cwd = os.getenv("TERMINAL_CWD", os.getcwd())
-                    ctx_len = None
-                    if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
-                        ctx_len = self.agent.context_compressor.context_length
-                    build_welcome_banner(
-                        console=cc,
-                        model=self.model,
-                        cwd=cwd,
-                        tools=tools,
-                        enabled_toolsets=self.enabled_toolsets,
-                        session_id=self.session_id,
-                        context_length=ctx_len,
-                    )
+                self._record_startup_banner_for_resize()
+                with _suspend_output_history():
+                    self._print_startup_banner(cc)
                 _cprint("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
                 # Show a random tip on new session
                 try:
@@ -12661,6 +12695,7 @@ class HermesCLI:
                 completer=_completer,
             ),
         )
+        self._tui_input_area = input_area
         # Keep prompt_toolkit on its simple tempfile path. Setting
         # buffer.tempfile = "prompt.md" triggers its complex-tempfile branch,
         # which tries to mkdir() the mkdtemp() directory again and raises
