@@ -2013,6 +2013,47 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
+def test_prompt_submit_emits_message_start_when_accepted_before_agent_ready(monkeypatch):
+    """Accepted prompts must immediately make the TUI busy.
+
+    On cold start the agent may still be building. The session is already
+    marked running while the background prompt thread waits for agent_ready, so
+    prompt.submit must emit a running event before that wait; otherwise the
+    frontend can look idle while the backend rejects follow-up input as busy.
+    """
+
+    started_targets = []
+    events = []
+    ready = threading.Event()
+
+    class _CapturedThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            started_targets.append(self._target)
+
+    server._sessions["sid"] = _session(agent=types.SimpleNamespace(), agent_ready=ready)
+    monkeypatch.setattr(server.threading, "Thread", _CapturedThread)
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: events.append((event, sid, payload)))
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "ping"},
+            }
+        )
+
+        assert resp["result"]["status"] == "streaming"
+        assert server._sessions["sid"]["running"] is True
+        assert started_targets, "prompt.submit should still defer the actual run to a worker thread"
+        assert ("message.start", "sid", None) in events
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 

@@ -3010,6 +3010,7 @@ def _(rid, params: dict) -> dict:
         session["running"] = True
 
     _start_agent_build(sid, session)
+    _emit("message.start", sid)
 
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
@@ -3026,7 +3027,7 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
             return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(rid, sid, session, text, emit_start=False)
 
     threading.Thread(target=run_after_agent_ready, daemon=True).start()
     return _ok(rid, {"status": "streaming"})
@@ -3131,14 +3132,17 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid, sid: str, session: dict, text: Any, *, emit_start: bool = True
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
     agent = session["agent"]
-    _emit("message.start", sid)
+    if emit_start:
+        _emit("message.start", sid)
 
     def run():
         approval_token = None

@@ -126,6 +126,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return sys('session not ready yet')
       }
 
+      patchUiState({ busy: true, status: 'submitting…' })
+
       // Always ask the backend whether this looks like a file drop.
       // The backend's _detect_file_drop handles paths with spaces, quotes,
       // Windows drive letters, and escaped characters correctly.

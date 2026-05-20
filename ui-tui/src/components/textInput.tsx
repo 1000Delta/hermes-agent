@@ -566,6 +566,19 @@ export function TextInput({
     }
   }
 
+  const clearLocalAfterSubmit = () => {
+    cancelLocalRender()
+    self.current = false
+    vRef.current = ''
+    curRef.current = 0
+    selRef.current = null
+    lineWidthRef.current = 0
+    undo.current = []
+    redo.current = []
+    setCur(0)
+    setSel(null)
+  }
+
   const scheduleLocalRender = () => {
     if (localRenderTimer.current) {
       return
@@ -886,8 +899,11 @@ export function TextInput({
           flushParentChange()
           commit(ins(vRef.current, curRef.current, '\n'), curRef.current + 1)
         } else {
+          const submitted = vRef.current
+
           flushParentChange()
-          cbSubmit.current?.(vRef.current)
+          clearLocalAfterSubmit()
+          cbSubmit.current?.(submitted)
         }
 
         return
